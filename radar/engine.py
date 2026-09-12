@@ -23,7 +23,7 @@ import sources
 
 MODEL = os.environ.get("RADAR_MODEL", os.environ.get("ASSISTANT_MODEL", "claude-haiku-4-5-20251001"))
 _DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-_CACHE = os.path.join(_DATA, "daily.json")
+_REPORTS = os.path.join(_DATA, "reports")
 
 
 # --------------------------------------------------------------- collect -------
@@ -80,12 +80,16 @@ def rank_trends(collected, top=6):
         c = next((c for c in clusters if _same(c["_canon"], _canon(s["term"]))), None)
         if c is None:
             c = {"_canon": _canon(s["term"]), "term": s["term"], "signals": [],
-                 "sources": set(), "metrics": [], "links": []}
+                 "sources": set(), "metrics": [], "links": [], "example": None}
             clusters.append(c)
         c["signals"].append(s)
         c["sources"].add(s["source"])
         c["metrics"].append(s["metric"])
         c["links"].append({"source": s["source"], "url": s["url"]})
+        # keep one real crawled post for this trend: signals arrive sorted by score
+        # descending, so the first example seen already belongs to the strongest signal
+        if s.get("example") and c["example"] is None:
+            c["example"] = s["example"]
         # prefer a readable, spaced label (Google Trends queries read best)
         if s["source"] == "google_trends" and " " in s["term"]:
             c["term"] = s["term"]
@@ -107,6 +111,7 @@ def rank_trends(collected, top=6):
             "window": "about a week" if fast else "6-12 weeks",
             "metrics": c["metrics"][:3],
             "links": c["links"][:3],
+            "example": c["example"],
         })
     trends.sort(key=lambda t: (-t["score"], -t["agreement"], -t["base"]))
     return trends[:top]
@@ -218,6 +223,13 @@ def make_ideas(topic, trends):
         used.add(t["term"])
         idea["link"] = (t["links"][0] if t.get("links") else {}).get("url", "")
         idea["source_of_signal"] = _srcs(t["sources"])
+        idea["channel"] = "TikTok" if "tiktok" in t["sources"] else \
+            ("Instagram" if "instagram" in t["sources"] else "Google Trends")
+        idea["example"] = t.get("example")
+        if idea["example"]:
+            idea["example"]["example_reason"] = (
+                "Highest-engagement real %s post currently using this trend, out of the posts crawled today."
+                % idea["example"]["example_source"].title())
     return ideas[:5]
 
 
@@ -226,6 +238,10 @@ def build_radar():
     collected = collect()
     trends = rank_trends(collected)
     ideas = make_ideas(collected["topic"], trends)
+    if not collected["sample"]:
+        # Live mode: never present an idea as ready-to-pitch without a real,
+        # clickable example behind it — suppress rather than show a gap.
+        ideas = [i for i in ideas if i.get("example")]
     return {
         "date": _dt.date.today().isoformat(),
         "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -240,22 +256,52 @@ def build_radar():
     }
 
 
-def daily(force=False):
-    """Today's radar, cached to one build per day (unless forced)."""
-    today = _dt.date.today().isoformat()
-    if not force:
-        try:
-            with open(_CACHE) as f:
-                cached = json.load(f)
-            if cached.get("date") == today:
-                return cached
-        except (OSError, ValueError):
-            pass
-    result = build_radar()
+def _report_path(date_str):
+    return os.path.join(_REPORTS, "%s.json" % date_str)
+
+
+def _load_report(date_str):
     try:
-        os.makedirs(_DATA, exist_ok=True)
-        with open(_CACHE, "w") as f:
+        with open(_report_path(date_str)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _save_report(date_str, result):
+    try:
+        os.makedirs(_REPORTS, exist_ok=True)
+        with open(_report_path(date_str), "w") as f:
             json.dump(result, f, indent=1)
     except OSError:
         pass
+
+
+def get_report(date_str):
+    """A specific past day's report, exactly as generated — never regenerates,
+    so a historical read's ideas and examples stay stable. None if not saved."""
+    return _load_report(date_str)
+
+
+def available_dates(year, month):
+    """ISO dates in this year/month that have a saved report, for the history
+    calendar — this must never have to read every historical report to answer."""
+    try:
+        names = os.listdir(_REPORTS)
+    except OSError:
+        return []
+    prefix = "%04d-%02d-" % (year, month)
+    return sorted(n[:-5] for n in names if n.startswith(prefix) and n.endswith(".json"))
+
+
+def daily(force=False):
+    """Today's radar, cached to one build per day (unless forced) and persisted
+    so it can be reloaded later from History without regenerating."""
+    today = _dt.date.today().isoformat()
+    if not force:
+        cached = _load_report(today)
+        if cached:
+            return cached
+    result = build_radar()
+    _save_report(today, result)
     return result

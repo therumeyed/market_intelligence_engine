@@ -23,6 +23,7 @@ since neither platform has a free public trend API.
 The topic is Google Trends /m/01mrgs == "Craft". Everything is overridable via
 env vars, so the same code runs any topic/category later.
 """
+import datetime as _dt
 import http.cookiejar
 import json
 import math
@@ -95,6 +96,37 @@ def _num(x, default=0.0):
         return float(x)
     except (TypeError, ValueError):
         return default
+
+
+def _iso_from_ts(ts):
+    """Best-effort ISO-8601 timestamp from an epoch number (seconds or ms) or an
+    already-ISO string. Returns None rather than guessing when it can't parse —
+    a missing publish date must never be silently invented."""
+    if not ts:
+        return None
+    if isinstance(ts, str):
+        try:
+            _dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return ts
+        except ValueError:
+            return None
+    try:
+        val = float(ts)
+        if val > 1e12:   # milliseconds
+            val /= 1000.0
+        return _dt.datetime.utcfromtimestamp(val).isoformat(timespec="seconds") + "Z"
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _example(source, url, title, author, published_at, metric_label):
+    """A single real evidence record for one crawled post. Never call this with a
+    fabricated field — omit the whole example instead (see the two callers below)."""
+    if not url:
+        return None
+    return {"example_source": source, "example_url": url, "example_title": (title or "")[:160],
+            "example_author": author or "", "example_published_at": published_at,
+            "example_metric": metric_label or ""}
 
 
 # ======================================================================= TRENDS
@@ -244,20 +276,31 @@ def tiktok():
                 age_days = (time.time() - created) / 86400.0 if created else 1e9
                 if age_days > 30:
                     continue
-                text = (info.get("desc") or "") + " " + (it.get("desc") or "")
-                for tag in _hashtags(text) or [kw.replace(" ", "")]:
-                    d = seen.setdefault(tag, {"plays": [], "n": 0})
+                desc_text = (info.get("desc") or it.get("desc") or "").strip()
+                author = ((info.get("author") or {}).get("nickname")
+                          or (info.get("author") or {}).get("unique_id")
+                          or (it.get("authorMeta") or {}).get("name") or "")
+                url = (info.get("share_url") or it.get("webVideoUrl") or it.get("shareUrl") or "")
+                for tag in _hashtags(desc_text) or [kw.replace(" ", "")]:
+                    d = seen.setdefault(tag, {"plays": [], "n": 0, "best": None})
                     d["plays"].append(plays); d["n"] += 1
+                    if url and (d["best"] is None or plays > d["best"]["plays"]):
+                        d["best"] = {"plays": plays, "author": author, "url": url,
+                                     "title": desc_text, "created": created}
     if not seen:
         return _sample("tiktok")
     out = []
     for tag, d in seen.items():
         d["plays"].sort()
         median = d["plays"][len(d["plays"]) // 2] if d["plays"] else 0
-        score = round(0.5 * _sat(d["n"], 6.0) + 0.5 * _sat(median, 60_000.0), 3)
-        out.append({"term": tag, "source": "tiktok", "score": score,
+        best = d["best"]
+        example = _example("tiktok", best["url"], best["title"], best["author"],
+                            _iso_from_ts(best["created"]),
+                            "%s plays" % _compact(best["plays"])) if best else None
+        out.append({"term": tag, "source": "tiktok", "score": round(0.5 * _sat(d["n"], 6.0) + 0.5 * _sat(median, 60_000.0), 3),
                     "metric": "TikTok: %d recent videos, %s median plays" % (d["n"], _compact(median)),
-                    "url": "https://www.tiktok.com/tag/%s" % urllib.parse.quote(tag)})
+                    "url": "https://www.tiktok.com/tag/%s" % urllib.parse.quote(tag),
+                    "example": example})
     out.sort(key=lambda s: -s["score"])
     return out[:8]
 
@@ -273,20 +316,32 @@ def instagram():
                 likes = int(_num(it.get("likesCount") or it.get("likes") or 0))
                 comments = int(_num(it.get("commentsCount") or it.get("comments") or 0))
                 eng = likes + 3 * comments
-                for h in (it.get("hashtags") or _hashtags(it.get("caption") or "")):
+                caption = (it.get("caption") or "").strip()
+                author = it.get("ownerUsername") or it.get("username") or ""
+                url = it.get("url") or it.get("postUrl") or it.get("permalink") or ""
+                ts = it.get("timestamp") or it.get("takenAt") or it.get("takenAtTimestamp")
+                for h in (it.get("hashtags") or _hashtags(caption)):
                     h = h.lstrip("#").lower()
-                    d = seen.setdefault(h, {"eng": [], "n": 0})
+                    d = seen.setdefault(h, {"eng": [], "n": 0, "best": None})
                     d["eng"].append(eng); d["n"] += 1
+                    if url and (d["best"] is None or eng > d["best"]["eng"]):
+                        d["best"] = {"eng": eng, "likes": likes, "comments": comments,
+                                     "author": author, "url": url, "caption": caption, "ts": ts}
     if not seen:
         return _sample("instagram")
     out = []
     for tag, d in seen.items():
         d["eng"].sort()
         median = d["eng"][len(d["eng"]) // 2] if d["eng"] else 0
-        score = round(0.5 * _sat(d["n"], 8.0) + 0.5 * _sat(median, 3_000.0), 3)
-        out.append({"term": tag, "source": "instagram", "score": score,
+        best = d["best"]
+        example = _example("instagram", best["url"], best["caption"], best["author"],
+                            _iso_from_ts(best["ts"]),
+                            "%s likes, %s comments" % (_compact(best["likes"]), _compact(best["comments"]))
+                            ) if best else None
+        out.append({"term": tag, "source": "instagram", "score": round(0.5 * _sat(d["n"], 8.0) + 0.5 * _sat(median, 3_000.0), 3),
                     "metric": "Instagram: %d recent posts, %s median engagement" % (d["n"], _compact(median)),
-                    "url": "https://www.instagram.com/explore/tags/%s/" % urllib.parse.quote(tag)})
+                    "url": "https://www.instagram.com/explore/tags/%s/" % urllib.parse.quote(tag),
+                    "example": example})
     out.sort(key=lambda s: -s["score"])
     return out[:8]
 

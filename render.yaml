@@ -52,6 +52,34 @@ services:
       - key: COMPETITOR_CRAWL_ON_BOOT
         value: "1"              # seed a baseline on first boot
 
+  # Spotlight Radar — standalone service, own URL, no shared DB. Self-contained
+  # (see radar/README.md): deliberately separate from the JB Hi-Fi demo above.
+  - type: web
+    name: spotlight-radar
+    runtime: docker
+    dockerfilePath: radar/Dockerfile
+    dockerContext: radar
+    plan: free
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: RADAR_TOPIC
+        value: crafts
+      - key: RADAR_TOPIC_MID
+        value: /m/01mrgs
+      - key: RADAR_GEO
+        value: AU
+      - key: ANTHROPIC_API_KEY
+        sync: false             # optional: Claude writes the 5 ideas; falls back to rules without it
+      - key: APIFY_API_KEY
+        sync: false             # optional: turns on live TikTok + Instagram; sample data without it
+      # NOTE: Render's free plan has no persistent disk — the daily report
+      # history (radar/data/reports/*.json) will NOT survive a redeploy or an
+      # instance spin-down/restart on this plan. History still works within a
+      # single running instance's lifetime; for real durability across
+      # deploys, either attach a paid persistent disk or move report storage
+      # to Postgres later (the same tradeoff already noted for Cron Jobs below).
+
   # Weekly competitor crawl — updates the shared DB the web service reads.
   # NOTE: Render Cron Jobs require a paid instance; until then the web app's
   # "Refresh" button (POST /api/competitors/refresh) triggers the same crawl.
